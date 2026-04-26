@@ -1,19 +1,13 @@
 import pandas as pd
 import numpy as np
-from dotenv import load_dotenv
+import gradio as gr
 
-from langchain_community.document_loaders import TextLoader
-from langchain_text_splitters import CharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
-import gradio as gr
-
-# Load environment variables (if any)
-load_dotenv()
-
-# Load books dataset
+# ---------------- Load Data ----------------
 books = pd.read_csv("books_with_emotions.csv")
+
 books["large_thumbnail"] = books["thumbnail"] + "&fife=w800"
 books["large_thumbnail"] = np.where(
     books["large_thumbnail"].isna(),
@@ -21,37 +15,31 @@ books["large_thumbnail"] = np.where(
     books["large_thumbnail"],
 )
 
-# Load and split text documents safely
-raw_documents = TextLoader("tagged_description.txt", encoding="utf-8").load()
-text_splitter = CharacterTextSplitter(separator="\n", chunk_size=500, chunk_overlap=0)
-documents = text_splitter.split_documents(raw_documents)
-
-# Initialize Hugging Face embeddings (local, no API key required)
-huggingface_embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-# Create vector DB
-db_books = Chroma.from_documents(
-    documents,
-    embedding=huggingface_embeddings
+# ---------------- Load DB ----------------
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
+db_books = Chroma(
+    persist_directory="./chroma_db",
+    embedding_function=embeddings
+)
 
-def retrieve_semantic_recommendations(
-        query: str,
-        category: str = None,
-        tone: str = None,
-        initial_top_k: int = 50,
-        final_top_k: int = 16,
-) -> pd.DataFrame:
+# ---------------- Logic ----------------
+def recommend_books(query, category, tone):
+    recs = db_books.similarity_search(query, k=50)
 
-    recs = db_books.similarity_search(query, k=initial_top_k)
-    books_list = [int(rec.page_content.strip('"').split()[0]) for rec in recs]
-    book_recs = books[books["isbn13"].isin(books_list)].head(initial_top_k)
+    indices = [
+        rec.metadata.get("index")
+        for rec in recs
+        if rec.metadata.get("index") is not None
+    ]
+
+    indices = [i for i in indices if i < len(books)]
+    book_recs = books.iloc[indices]
 
     if category != "All":
-        book_recs = book_recs[book_recs["simple_categories"] == category].head(final_top_k)
-    else:
-        book_recs = book_recs.head(final_top_k)
+        book_recs = book_recs[book_recs["simple_categories"] == category]
 
     if tone == "Happy":
         book_recs.sort_values(by="joy", ascending=False, inplace=True)
@@ -64,78 +52,30 @@ def retrieve_semantic_recommendations(
     elif tone == "Sad":
         book_recs.sort_values(by="sadness", ascending=False, inplace=True)
 
-    return book_recs
-
-
-def recommend_books(
-        query: str,
-        category: str,
-        tone: str
-):
-    recommendations = retrieve_semantic_recommendations(query, category, tone)
     results = []
-
-    for _, row in recommendations.iterrows():
-        description = row["description"]
-        truncated_desc_split = description.split()
-        truncated_description = " ".join(truncated_desc_split[:30]) + "..."
-
-        authors_split = row["authors"].split(";")
-        if len(authors_split) == 2:
-            authors_str = f"{authors_split[0]} and {authors_split[1]}"
-        elif len(authors_split) > 2:
-            authors_str = f"{', '.join(authors_split[:-1])}, and {authors_split[-1]}"
-        else:
-            authors_str = row["authors"]
-
-        caption = f"**{row['title']}** by *{authors_str}*  \n\n{truncated_description}"
+    for _, row in book_recs.head(16).iterrows():
+        caption = f"{row['title']}\n{row['authors']}"
         results.append((row["large_thumbnail"], caption))
+
     return results
 
-
-# UI
+# ---------------- UI ----------------
 categories = ["All"] + sorted(books["simple_categories"].unique())
-tones = ["All"] + ["Happy", "Surprising", "Angry", "Suspenseful", "Sad"]
+tones = ["All", "Happy", "Surprising", "Angry", "Suspenseful", "Sad"]
 
-with gr.Blocks(theme=gr.themes.Glass()) as dashboard:
-    # Hero section
-    with gr.Column(elem_id="hero", scale=1):
-        gr.Markdown(
-            """
-            # 📚✨ Semantic Book Recommender  
-            Find your next favorite read with AI-powered recommendations.  
-            Search by **story idea**, **category**, or even the **emotion** you want to feel!  
-            """,
-            elem_id="title-text"
-        )
+with gr.Blocks() as demo:
+    gr.Markdown("# 📚 Book Recommender")
 
-    # Controls section
+    query = gr.Textbox(label="Describe a book")
+
     with gr.Row():
-        user_query = gr.Textbox(
-            label="🔍 Describe a book you’d like to read:",
-            placeholder="e.g., A mystery novel set in Victorian London",
-            lines=2
-        )
-    with gr.Row():
-        category_dropdown = gr.Dropdown(choices=categories, label="📂 Choose a category:", value="All")
-        tone_dropdown = gr.Dropdown(choices=tones, label="🎭 Choose an emotional tone:", value="All")
-        submit_button = gr.Button("🚀 Get Recommendations", variant="primary")
+        category = gr.Dropdown(categories, value="All")
+        tone = gr.Dropdown(tones, value="All")
 
-    # Results section
-    gr.Markdown("## 📖 Recommended Books")
-    output = gr.Gallery(
-        label="Recommended books",
-        columns=4,
-        rows=4,
-        height="auto",
-        elem_id="gallery"
-    )
+    btn = gr.Button("Get Recommendations")
+    output = gr.Gallery(columns=4)
 
-    # Connect button to function
-    submit_button.click(fn=recommend_books,
-                        inputs=[user_query, category_dropdown, tone_dropdown],
-                        outputs=output)
+    btn.click(recommend_books, [query, category, tone], output)
 
-# Run app
 if __name__ == "__main__":
-    dashboard.launch(share=True)
+    demo.launch()
